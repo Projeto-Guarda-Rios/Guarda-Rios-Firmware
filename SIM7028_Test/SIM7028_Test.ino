@@ -22,7 +22,7 @@
  * - turbidity is int16 fixed-point in centi-NTU
  * - sample order is temperature first, then turbidity
  * - multi-byte integers are encoded big-endian
- * - start_timestamp uses seconds since boot for this test sketch
+ * - start_timestamp is a UTC Unix timestamp from the modem clock
  */
 
 #include <Arduino.h>
@@ -50,9 +50,10 @@ static const uint16_t SAMPLE_INTERVAL_S = 60;
 static const uint8_t SAMPLE_COUNT = 6;
 static const size_t AUTH_TAG_SIZE = 16;
 static const int16_t MIN_TURBIDITY_CENTI_NTU = 0;
-static const int16_t MAX_TURBIDITY_CENTI_NTU = 327;
-static const int16_t MIN_TEMPERATURE_CENTI_C = -5;
-static const int16_t MAX_TEMPERATURE_CENTI_C = 50;
+static const int16_t MAX_TURBIDITY_CENTI_NTU = 32767;
+static const int16_t MIN_TEMPERATURE_CENTI_C = -500;
+static const int16_t MAX_TEMPERATURE_CENTI_C = 5000;
+static const char *NTP_SERVER = "pool.ntp.org";
 
 static const uint32_t AT_TIMEOUT_MS = 3000;
 static const uint32_t SIM_READY_TIMEOUT_MS = 30000;
@@ -61,6 +62,9 @@ static const uint32_t NETOPEN_TIMEOUT_MS = 300000;
 static const uint32_t CIPOPEN_TIMEOUT_MS = 30000;
 static const uint32_t CIPSEND_PROMPT_TIMEOUT_MS = 5000;
 static const uint32_t CIPSEND_RESULT_TIMEOUT_MS = 30000;
+static const uint32_t CCLK_TIMEOUT_MS = 3000;
+static const uint32_t CNTP_TIMEOUT_MS = 10000;
+static const uint32_t UTC_SYNC_TIMEOUT_MS = 30000;
 static const uint32_t QUIET_GAP_MS = 200;
 
 HardwareSerial ModemSerial(2);
@@ -70,6 +74,11 @@ struct SensorSample {
   int16_t turbidityCentiNtu;
   int16_t temperatureCentiC;
 };
+
+static bool sendAT(const char *command,
+                   const char *expectA,
+                   const char *expectB = nullptr,
+                   uint32_t timeoutMs = AT_TIMEOUT_MS);
 
 static void flushModemInput(void) {
   while (ModemSerial.available() > 0) {
@@ -102,6 +111,159 @@ static String readModemResponse(uint32_t timeoutMs) {
   }
 
   return response;
+}
+
+static String sendATForResponse(const char *command, uint32_t timeoutMs = AT_TIMEOUT_MS) {
+  flushModemInput();
+
+  Serial.printf("\n>> %s\n", command);
+  ModemSerial.print(command);
+  ModemSerial.print("\r");
+
+  String response = readModemResponse(timeoutMs);
+  if (response.length() == 0) {
+    Serial.println("<< [timeout]");
+  } else {
+    Serial.print("<< ");
+    Serial.print(response);
+    if (!response.endsWith("\n")) {
+      Serial.println();
+    }
+  }
+
+  return response;
+}
+
+static int32_t parseFixedWidthInt(const char *text, size_t length) {
+  int32_t value = 0;
+
+  for (size_t index = 0; index < length; ++index) {
+    if (text[index] < '0' || text[index] > '9') {
+      return -1;
+    }
+    value = (value * 10) + (text[index] - '0');
+  }
+
+  return value;
+}
+
+static int64_t daysFromCivil(int32_t year, uint32_t month, uint32_t day) {
+  year -= month <= 2U;
+  const int32_t era = (year >= 0 ? year : year - 399) / 400;
+  const uint32_t yoe = (uint32_t)(year - era * 400);
+  const uint32_t adjustedMonth = month + (month > 2U ? (uint32_t)-3 : 9U);
+  const uint32_t doy = (153U * adjustedMonth + 2U) / 5U + day - 1U;
+  const uint32_t doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+  return (int64_t)era * 146097LL + (int64_t)doe - 719468LL;
+}
+
+static bool parseCclkToUtcEpoch(const String &response, uint32_t &utcEpoch) {
+  const int prefixIndex = response.indexOf("+CCLK: \"");
+  if (prefixIndex < 0) {
+    return false;
+  }
+
+  const int startIndex = prefixIndex + 8;
+  const int endIndex = response.indexOf('"', startIndex);
+  if (endIndex < 0) {
+    return false;
+  }
+
+  const String timeText = response.substring(startIndex, endIndex);
+  const char *text = timeText.c_str();
+  const char *firstSlash = strchr(text, '/');
+  if (firstSlash == nullptr) {
+    return false;
+  }
+
+  const size_t yearDigits = (size_t)(firstSlash - text);
+  if (yearDigits != 2U && yearDigits != 4U) {
+    return false;
+  }
+
+  int32_t year = parseFixedWidthInt(text, yearDigits);
+  if (year < 0) {
+    return false;
+  }
+  if (yearDigits == 2U) {
+    year += 2000;
+  }
+
+  const char *monthText = firstSlash + 1;
+  if (monthText[2] != '/' || monthText[5] != ',' || monthText[8] != ':' || monthText[11] != ':') {
+    return false;
+  }
+
+  const int32_t month = parseFixedWidthInt(monthText, 2);
+  const int32_t day = parseFixedWidthInt(monthText + 3, 2);
+  const int32_t hour = parseFixedWidthInt(monthText + 6, 2);
+  const int32_t minute = parseFixedWidthInt(monthText + 9, 2);
+  const int32_t second = parseFixedWidthInt(monthText + 12, 2);
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 ||
+      minute > 59 || second < 0 || second > 59) {
+    return false;
+  }
+
+  const char sign = monthText[14];
+  if (sign != '+' && sign != '-') {
+    return false;
+  }
+
+  int32_t timezoneQuarterHours = parseFixedWidthInt(monthText + 15, 2);
+  if (timezoneQuarterHours < 0) {
+    return false;
+  }
+  if (sign == '-') {
+    timezoneQuarterHours = -timezoneQuarterHours;
+  }
+
+  const int64_t days = daysFromCivil(year, (uint32_t)month, (uint32_t)day);
+  const int64_t localSeconds =
+      days * 86400LL + (int64_t)hour * 3600LL + (int64_t)minute * 60LL + (int64_t)second;
+  const int64_t utcSeconds = localSeconds - (int64_t)timezoneQuarterHours * 15LL * 60LL;
+  if (utcSeconds < 0 || utcSeconds > 0xFFFFFFFFLL) {
+    return false;
+  }
+
+  utcEpoch = (uint32_t)utcSeconds;
+  return true;
+}
+
+static bool tryReadUtcTimestamp(uint32_t &utcEpoch) {
+  const String response = sendATForResponse("AT+CCLK?", CCLK_TIMEOUT_MS);
+  return response.length() > 0 && parseCclkToUtcEpoch(response, utcEpoch);
+}
+
+static bool syncModemTimeWithNtp(void) {
+  char command[96];
+  snprintf(command, sizeof(command), "AT+CNTP=\"%s\",0", NTP_SERVER);
+  if (!sendAT(command, "OK", nullptr, CNTP_TIMEOUT_MS)) {
+    return false;
+  }
+
+  const String response = sendATForResponse("AT+CNTP", CNTP_TIMEOUT_MS);
+  return responseContains(response, "+CNTP: 0");
+}
+
+static bool getUtcStartTimestamp(uint32_t &utcEpoch) {
+  if (tryReadUtcTimestamp(utcEpoch)) {
+    Serial.printf("UTC start timestamp=%lu\n", (unsigned long)utcEpoch);
+    return true;
+  }
+
+  Serial.println("UTC time not ready from network clock, trying NTP sync");
+
+  const uint32_t startedAt = millis();
+  while (millis() - startedAt < UTC_SYNC_TIMEOUT_MS) {
+    if (syncModemTimeWithNtp() && tryReadUtcTimestamp(utcEpoch)) {
+      Serial.printf("UTC start timestamp=%lu\n", (unsigned long)utcEpoch);
+      return true;
+    }
+
+    delay(2000);
+  }
+
+  return false;
 }
 
 static void appendU8(uint8_t *buffer, size_t bufferSize, size_t &offset, uint8_t value) {
@@ -163,7 +325,7 @@ static bool appendAuthTag(uint8_t *buffer, size_t bufferSize, size_t &offset) {
   return true;
 }
 
-static size_t buildTestPacket(uint8_t *buffer, size_t bufferSize) {
+static size_t buildTestPacket(uint8_t *buffer, size_t bufferSize, uint32_t startTimestampUtc) {
   const size_t expectedSize =
       1 + 2 + 4 + 4 + 2 + 1 + ((size_t)SAMPLE_COUNT * sizeof(SensorSample)) + AUTH_TAG_SIZE;
 
@@ -171,13 +333,12 @@ static size_t buildTestPacket(uint8_t *buffer, size_t bufferSize) {
     return 0;
   }
 
-  const uint32_t startTimestamp = millis() / 1000UL;
   size_t offset = 0;
 
   appendU8(buffer, bufferSize, offset, PROTOCOL_VERSION);
   appendU16BE(buffer, bufferSize, offset, STATION_ID);
   appendU32BE(buffer, bufferSize, offset, gPacketCounter);
-  appendU32BE(buffer, bufferSize, offset, startTimestamp);
+  appendU32BE(buffer, bufferSize, offset, startTimestampUtc);
   appendU16BE(buffer, bufferSize, offset, SAMPLE_INTERVAL_S);
   appendU8(buffer, bufferSize, offset, SAMPLE_COUNT);
 
@@ -218,24 +379,11 @@ static void printHexDump(const uint8_t *buffer, size_t length) {
 
 static bool sendAT(const char *command,
                    const char *expectA,
-                   const char *expectB = nullptr,
-                   uint32_t timeoutMs = AT_TIMEOUT_MS) {
-  flushModemInput();
-
-  Serial.printf("\n>> %s\n", command);
-  ModemSerial.print(command);
-  ModemSerial.print("\r");
-
-  String response = readModemResponse(timeoutMs);
+                   const char *expectB,
+                   uint32_t timeoutMs) {
+  String response = sendATForResponse(command, timeoutMs);
   if (response.length() == 0) {
-    Serial.println("<< [timeout]");
     return false;
-  }
-
-  Serial.print("<< ");
-  Serial.print(response);
-  if (!response.endsWith("\n")) {
-    Serial.println();
   }
 
   if (expectA != nullptr && responseContains(response, expectA)) {
@@ -355,9 +503,9 @@ static bool openUdpSocket(void) {
   return sendAT(command, "+CIPOPEN: 0,0", nullptr, CIPOPEN_TIMEOUT_MS);
 }
 
-static bool sendBinaryPacketUdp(void) {
+static bool sendBinaryPacketUdp(uint32_t startTimestampUtc) {
   uint8_t packet[128];
-  const size_t packetLength = buildTestPacket(packet, sizeof(packet));
+  const size_t packetLength = buildTestPacket(packet, sizeof(packet), startTimestampUtc);
   if (packetLength == 0) {
     Serial.println("Packet build failed");
     return false;
@@ -465,8 +613,14 @@ void setup() {
   }
 
   randomSeed((uint32_t)micros());
+  uint32_t startTimestampUtc = 0;
 
-  if (!sendBinaryPacketUdp()) {
+  if (!getUtcStartTimestamp(startTimestampUtc)) {
+    Serial.println("FAIL: UTC time read failed");
+    return;
+  }
+
+  if (!sendBinaryPacketUdp(startTimestampUtc)) {
     Serial.println("FAIL: UDP binary packet send failed");
     return;
   }
