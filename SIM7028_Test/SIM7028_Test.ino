@@ -30,6 +30,8 @@
 #include <string.h>
 #include <mbedtls/md.h>
 
+#include "station_secrets.h"
+
 static const int MODEM_RX_PIN = 16;
 static const int MODEM_TX_PIN = 17;
 static const unsigned long MODEM_BAUD = 115200;
@@ -45,7 +47,6 @@ static const uint8_t NB_BAND = 20;
 
 static const uint8_t PROTOCOL_VERSION = 1;
 static const uint16_t STATION_ID = 1;
-static const char *STATION_TOKEN = "a70b521465b960822290c93b7e06b2b5111e140ff17e0dc4e7107c53565775c0";
 static const uint16_t SAMPLE_INTERVAL_S = 60;
 static const uint8_t SAMPLE_COUNT = 6;
 static const size_t AUTH_TAG_SIZE = 16;
