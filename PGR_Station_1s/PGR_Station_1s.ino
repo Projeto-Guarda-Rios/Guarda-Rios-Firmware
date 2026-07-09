@@ -2,8 +2,8 @@
  * Guarda-Rios Station
  *
  * Reads turbidity and temperature data from STM32L053R8 via RS-485.
- * Samples every 5 minutes, batches 12 samples, and sends one authenticated
- * binary UDP packet over SIM7028 NB-IoT.
+ * Samples every second and sends one authenticated binary UDP packet per
+ * sample over SIM7028 NB-IoT.
  */
 
 #include <Arduino.h>
@@ -26,6 +26,7 @@ static const unsigned long RS485_BAUD = 9600;
 
 /* Status LED */
 static const int IO18_LED_PIN = 18;
+static const uint16_t IO18_LED_BLINK_MS = 80;
 
 /* UDP endpoint */
 static const char *UDP_SERVER_IP = "172.233.121.41";
@@ -39,8 +40,8 @@ static const uint8_t NB_BAND = 20;
 /* Binary ingest protocol */
 static const uint8_t PROTOCOL_VERSION = 1;
 static const uint16_t STATION_ID = 1;
-static const uint16_t SAMPLE_INTERVAL_S = 300;
-static const uint8_t SAMPLE_COUNT = 12;
+static const uint16_t SAMPLE_INTERVAL_S = 1;
+static const uint8_t SAMPLE_COUNT = 1;
 static const int32_t TIMESTAMP_OFFSET_S = 0;
 static const size_t AUTH_TAG_SIZE = 16;
 static const char *NTP_SERVER = "pool.ntp.org";
@@ -61,7 +62,7 @@ static const uint32_t CCLK_TIMEOUT_MS = 3000;
 static const uint32_t CNTP_TIMEOUT_MS = 10000;
 static const uint32_t UTC_SYNC_TIMEOUT_MS = 30000;
 static const uint32_t QUIET_GAP_MS = 200;
-static const uint32_t SENSOR_FRAME_TIMEOUT_MS = 10000;
+static const uint32_t SENSOR_FRAME_TIMEOUT_MS = 800;
 static const uint32_t SAMPLE_INTERVAL_MS = (uint32_t)SAMPLE_INTERVAL_S * 1000UL;
 
 HardwareSerial RS485Serial(1);
@@ -78,16 +79,16 @@ static uint32_t gPacketCounter = 1;
 static uint32_t gNextSampleAt = 0;
 static uint32_t gBatchStartTimestampUtc = 0;
 static bool gModemReady = false;
-static bool gIo18LedOn = false;
 
 static bool sendAT(const char *command,
                    const char *expectA,
                    const char *expectB = nullptr,
                    uint32_t timeoutMs = AT_TIMEOUT_MS);
 
-static void toggleIo18Led(void) {
-  gIo18LedOn = !gIo18LedOn;
-  digitalWrite(IO18_LED_PIN, gIo18LedOn ? HIGH : LOW);
+static void blinkIo18Led(void) {
+  digitalWrite(IO18_LED_PIN, HIGH);
+  delay(IO18_LED_BLINK_MS);
+  digitalWrite(IO18_LED_PIN, LOW);
 }
 
 static int16_t clampToInt16(int32_t value, int16_t minimum, int16_t maximum) {
@@ -729,7 +730,6 @@ static bool sendCurrentBatch(void) {
 
   if (sendBinaryPacketUdp(gBatchStartTimestampUtc, gSamples, gSampleCount)) {
     Serial.println("PASS: batched binary packet sent over UDP");
-    toggleIo18Led();
     resetBatch();
     return true;
   } else {
@@ -791,7 +791,7 @@ void setup() {
   delay(200);
 
   Serial.println();
-  Serial.println("=== Guarda-Rios Station SIM7028 UDP ===");
+  Serial.println("=== Guarda-Rios Station SIM7028 UDP 1s ===");
   Serial.printf("Sample interval=%u s batch size=%u\n",
                 (unsigned)SAMPLE_INTERVAL_S,
                 (unsigned)SAMPLE_COUNT);
@@ -821,6 +821,7 @@ void loop() {
   const uint32_t now = millis();
   if ((int32_t)(now - gNextSampleAt) >= 0) {
     gNextSampleAt += SAMPLE_INTERVAL_MS;
+    blinkIo18Led();
     collectScheduledSample();
 
     if ((int32_t)(millis() - gNextSampleAt) >= 0) {
