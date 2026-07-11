@@ -38,7 +38,7 @@ Requires `arm-none-eabi-gcc` on PATH.
 
 | File | Description |
 |------|-------------|
-| `PGR_Station.ino` | Reads the RS-485 sensor frame, batches samples, and sends authenticated binary UDP packets to the Guarda-Rios ingest server over the SIM7028 NB-IoT modem. |
+| `PGR_Station.ino` | Wakes from ESP32 timer deep sleep, reads the RS-485 sensor frame, sends authenticated binary UDP packets to the Guarda-Rios ingest server over SIM7028 NB-IoT, then returns to deep sleep. Unsent batch data and the packet counter are retained across timer wakes. |
 
 Upload via Arduino IDE, PlatformIO, or the configurable flashing helper below.
 
@@ -107,9 +107,12 @@ Use `--station-id` when the backend already has an assigned numeric station
 ID. If it is omitted, the helper derives a stable default from
 `--station-name`, then lets the operator accept or override it.
 
-By default the helper sets `sample-count` to `1`, so a packet is sent every
-`--send-interval` seconds. For batching, set `--sample-count`; the packet send
-cadence is approximately `send_interval * sample_count` seconds.
+By default the helper sets `sample-count` to `1`, so the ESP32 wakes, reads,
+sends, and returns to deep sleep every `--send-interval` seconds. For batching,
+set `--sample-count`; samples are retained in RTC memory across deep sleeps and
+the packet send cadence is approximately `send_interval * sample_count`
+seconds. The SIM7028 socket is closed and its radio/baseband is set to minimum
+functionality before every ESP32 deep sleep.
 The helper sends the modem clock unchanged by default. Use
 `--timestamp-offset` to add or subtract seconds when a deployment needs a
 fixed correction.

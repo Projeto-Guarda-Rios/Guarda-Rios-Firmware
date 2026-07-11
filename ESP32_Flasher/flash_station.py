@@ -177,13 +177,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--send-interval",
         type=interval_arg,
-        help="seconds between packets when sample-count is 1",
+        help="ESP32 deep-sleep interval; packets are sent every interval when sample-count is 1",
     )
     parser.add_argument(
         "--sample-count",
         type=sample_count_arg,
         default=1,
-        help="samples per packet; use 1 to send every send-interval seconds (default: 1)",
+        help="samples retained across deep sleeps per packet; use 1 to send each wake (default: 1)",
     )
     parser.add_argument(
         "--timestamp-offset",
@@ -238,6 +238,7 @@ def main() -> int:
     print(f"Sample interval: {send_interval} s")
     print(f"Samples per packet: {args.sample_count}")
     print(f"Timestamp offset: {args.timestamp_offset} s")
+    print(f"ESP32 deep-sleep interval: {send_interval} s")
     print(f"Approximate packet send cadence: {send_interval * args.sample_count} s")
     print()
 

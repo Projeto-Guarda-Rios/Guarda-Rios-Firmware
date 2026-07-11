@@ -2,12 +2,14 @@
  * Guarda-Rios Station
  *
  * Reads turbidity and temperature data from STM32L053R8 via RS-485.
- * Samples every 5 minutes, batches 12 samples, and sends one authenticated
- * binary UDP packet over SIM7028 NB-IoT.
+ * Wakes on a timer, reads the AquaNode over RS-485, sends authenticated
+ * binary UDP data over SIM7028 NB-IoT, then returns to ESP32 deep sleep.
  */
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
 #include <mbedtls/md.h>
 #include <string.h>
 
@@ -62,7 +64,8 @@ static const uint32_t CNTP_TIMEOUT_MS = 10000;
 static const uint32_t UTC_SYNC_TIMEOUT_MS = 30000;
 static const uint32_t QUIET_GAP_MS = 200;
 static const uint32_t SENSOR_FRAME_TIMEOUT_MS = 10000;
-static const uint32_t SAMPLE_INTERVAL_MS = (uint32_t)SAMPLE_INTERVAL_S * 1000UL;
+static const uint64_t SLEEP_INTERVAL_US = (uint64_t)SAMPLE_INTERVAL_S * 1000000ULL;
+static const uint32_t RETAINED_STATE_MAGIC = 0x47525331UL;  // "GRS1"
 
 HardwareSerial RS485Serial(1);
 HardwareSerial ModemSerial(2);
@@ -72,11 +75,15 @@ struct SensorSample {
   int16_t temperatureCentiC;
 };
 
-static SensorSample gSamples[SAMPLE_COUNT];
-static uint8_t gSampleCount = 0;
-static uint32_t gPacketCounter = 1;
-static uint32_t gNextSampleAt = 0;
-static uint32_t gBatchStartTimestampUtc = 0;
+struct RetainedState {
+  uint32_t magic;
+  SensorSample samples[SAMPLE_COUNT];
+  uint8_t sampleCount;
+  uint32_t packetCounter;
+};
+
+/* RTC slow memory survives timer deep-sleep resets, but not power loss. */
+RTC_DATA_ATTR static RetainedState gRetained;
 static bool gModemReady = false;
 static bool gIo18LedOn = false;
 
@@ -84,6 +91,17 @@ static bool sendAT(const char *command,
                    const char *expectA,
                    const char *expectB = nullptr,
                    uint32_t timeoutMs = AT_TIMEOUT_MS);
+
+static void initializeRetainedState(void) {
+  if (gRetained.magic == RETAINED_STATE_MAGIC && gRetained.sampleCount <= SAMPLE_COUNT &&
+      gRetained.packetCounter != 0) {
+    return;
+  }
+
+  memset(&gRetained, 0, sizeof(gRetained));
+  gRetained.magic = RETAINED_STATE_MAGIC;
+  gRetained.packetCounter = 1;
+}
 
 static void toggleIo18Led(void) {
   gIo18LedOn = !gIo18LedOn;
@@ -352,7 +370,7 @@ static size_t buildPacket(uint8_t *buffer,
 
   appendU8(buffer, bufferSize, offset, PROTOCOL_VERSION);
   appendU16BE(buffer, bufferSize, offset, STATION_ID);
-  appendU32BE(buffer, bufferSize, offset, gPacketCounter);
+  appendU32BE(buffer, bufferSize, offset, gRetained.packetCounter);
   appendU32BE(buffer, bufferSize, offset, startTimestampUtc);
   appendU16BE(buffer, bufferSize, offset, SAMPLE_INTERVAL_S);
   appendU8(buffer, bufferSize, offset, sampleCount);
@@ -551,6 +569,9 @@ static bool initializeModem(void) {
 static void closeSession(void) {
   sendAT("AT+CIPCLOSE=0", "+CIPCLOSE: 0,0", nullptr, 10000);
   sendAT("AT+NETCLOSE", "+NETCLOSE: 0", nullptr, 10000);
+  // Disable the modem RF/baseband while the ESP32 sleeps.  It is restored by
+  // prepareModem() on the next timer wake-up.
+  sendAT("AT+CFUN=0", "OK", nullptr, 10000);
   gModemReady = false;
 }
 
@@ -576,7 +597,7 @@ static bool sendBinaryPacketUdp(uint32_t startTimestampUtc,
   }
 
   Serial.printf("Sending packet counter=%lu samples=%u interval=%u s start=%lu\n",
-                (unsigned long)gPacketCounter,
+                (unsigned long)gRetained.packetCounter,
                 (unsigned)sampleCount,
                 (unsigned)SAMPLE_INTERVAL_S,
                 (unsigned long)startTimestampUtc);
@@ -638,7 +659,7 @@ static bool sendBinaryPacketUdp(uint32_t startTimestampUtc,
     return false;
   }
 
-  ++gPacketCounter;
+  ++gRetained.packetCounter;
   return true;
 }
 
@@ -712,12 +733,11 @@ static bool readSensorFrame(SensorSample &sample, uint32_t timeoutMs) {
 }
 
 static void resetBatch(void) {
-  gSampleCount = 0;
-  gBatchStartTimestampUtc = 0;
+  gRetained.sampleCount = 0;
 }
 
 static bool sendCurrentBatch(void) {
-  if (gSampleCount == 0) {
+  if (gRetained.sampleCount == 0) {
     Serial.println("No samples queued for send");
     return true;
   }
@@ -727,7 +747,17 @@ static bool sendCurrentBatch(void) {
     return false;
   }
 
-  if (sendBinaryPacketUdp(gBatchStartTimestampUtc, gSamples, gSampleCount)) {
+  uint32_t timestampUtc = 0;
+  if (!getUtcTimestamp(timestampUtc)) {
+    Serial.println("Cannot timestamp packet: UTC time read failed");
+    return false;
+  }
+
+  // The modem clock is read after the last sample.  Earlier batch entries are
+  // spaced by the configured interval, matching the ingest protocol.
+  const uint32_t batchStartTimestampUtc =
+      timestampUtc - ((uint32_t)(gRetained.sampleCount - 1U) * SAMPLE_INTERVAL_S);
+  if (sendBinaryPacketUdp(batchStartTimestampUtc, gRetained.samples, gRetained.sampleCount)) {
     Serial.println("PASS: batched binary packet sent over UDP");
     toggleIo18Led();
     resetBatch();
@@ -740,14 +770,14 @@ static bool sendCurrentBatch(void) {
 }
 
 static void collectScheduledSample(void) {
-  if (gSampleCount >= SAMPLE_COUNT) {
+  if (gRetained.sampleCount >= SAMPLE_COUNT) {
     Serial.println("Batch is full, retrying send before collecting another sample");
     sendCurrentBatch();
     return;
   }
 
   Serial.printf("Sampling sensor for slot %u/%u\n",
-                (unsigned)(gSampleCount + 1U),
+                (unsigned)(gRetained.sampleCount + 1U),
                 (unsigned)SAMPLE_COUNT);
   flushRs485Input();
 
@@ -757,28 +787,16 @@ static void collectScheduledSample(void) {
     return;
   }
 
-  if (gSampleCount == 0) {
-    if (!ensureModemReady()) {
-      Serial.println("Cannot timestamp batch: modem is not ready");
-      return;
-    }
-
-    if (!getUtcTimestamp(gBatchStartTimestampUtc)) {
-      Serial.println("Cannot timestamp batch: UTC time read failed");
-      return;
-    }
-  }
-
-  gSamples[gSampleCount] = sample;
-  ++gSampleCount;
+  gRetained.samples[gRetained.sampleCount] = sample;
+  ++gRetained.sampleCount;
 
   Serial.printf("Sample %u stored: turbidity=%.2f NTU temperature=%.2f C\n",
-                (unsigned)gSampleCount,
+                (unsigned)gRetained.sampleCount,
                 sample.turbidityCentiNtu / 100.0f,
                 sample.temperatureCentiC / 100.0f);
 
-  if (gSampleCount < SAMPLE_COUNT) {
-    Serial.printf("Batch progress: %u/%u samples\n", (unsigned)gSampleCount, (unsigned)SAMPLE_COUNT);
+  if (gRetained.sampleCount < SAMPLE_COUNT) {
+    Serial.printf("Batch progress: %u/%u samples\n", (unsigned)gRetained.sampleCount, (unsigned)SAMPLE_COUNT);
     return;
   }
 
@@ -786,9 +804,42 @@ static void collectScheduledSample(void) {
   sendCurrentBatch();
 }
 
+static void enterDeepSleep(void) {
+  // A successful packet does not need an open PDP/socket while waiting for
+  // the next acquisition.  CFUN=0 is also sent when opening the session
+  // failed part way through, so the modem radio is not left active.
+  if (gModemReady) {
+    closeSession();
+  } else {
+    sendAT("AT+CFUN=0", "OK", nullptr, 10000);
+  }
+
+  RS485Serial.end();
+  ModemSerial.end();
+
+  // Keep board-controlled outputs in their inactive state throughout deep
+  // sleep.  The holds are released at the beginning of the next boot.
+  digitalWrite(RS485_DE, LOW);
+  digitalWrite(IO18_LED_PIN, LOW);
+  gpio_hold_en((gpio_num_t)RS485_DE);
+  gpio_hold_en((gpio_num_t)IO18_LED_PIN);
+  gpio_deep_sleep_hold_en();
+
+  Serial.printf("Sleeping for %u s\n", (unsigned)SAMPLE_INTERVAL_S);
+  Serial.flush();
+  esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
+  esp_deep_sleep_start();
+}
+
 void setup() {
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)RS485_DE);
+  gpio_hold_dis((gpio_num_t)IO18_LED_PIN);
+
   Serial.begin(115200);
   delay(200);
+
+  initializeRetainedState();
 
   Serial.println();
   Serial.println("=== Guarda-Rios Station SIM7028 UDP ===");
@@ -807,27 +858,9 @@ void setup() {
 
   ModemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
   ModemSerial.setTimeout(1000);
-
-  delay(1000);
-  gModemReady = initializeModem();
-  if (!gModemReady) {
-    Serial.println("Modem initialization failed in setup, will retry before timestamp/send");
-  }
-
-  gNextSampleAt = millis();
 }
 
 void loop() {
-  const uint32_t now = millis();
-  if ((int32_t)(now - gNextSampleAt) >= 0) {
-    gNextSampleAt += SAMPLE_INTERVAL_MS;
-    collectScheduledSample();
-
-    if ((int32_t)(millis() - gNextSampleAt) >= 0) {
-      gNextSampleAt = millis() + SAMPLE_INTERVAL_MS;
-      Serial.println("Sampling schedule slipped, next sample delayed by one interval");
-    }
-  }
-
-  delay(50);
+  collectScheduledSample();
+  enterDeepSleep();
 }
