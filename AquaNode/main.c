@@ -136,7 +136,15 @@ void SysTick_Handler(void) {
 
 static void delay_ms(uint32_t ms) {
     uint32_t start = ms_ticks;
-    while ((ms_ticks - start) < ms);
+    while ((ms_ticks - start) < ms) {
+        /*
+         * SysTick wakes the core at most once per millisecond.  Sleeping
+         * here keeps all existing timings and the continuous RS-485 protocol
+         * unchanged, while avoiding a busy CPU for the 100 ms startup,
+         * DS18B20 conversion, inter-frame, and 2 s sample delays.
+         */
+        __asm__ volatile("wfi" ::: "memory");
+    }
 }
 
 /* Approximate microsecond delay at 16 MHz */
@@ -232,9 +240,15 @@ static uint8_t u1_rx_buf(uint8_t *buf, uint8_t max, uint16_t timeout_ms) {
         if (USART1_ISR & ISR_RXNE) {
             buf[count++] = (uint8_t)USART1_RDR;
             last_byte = ms_ticks;
+            continue;
         }
         /* Frame-end: gap > 5 ms after first byte */
         if (count > 0 && (ms_ticks - last_byte) > 5) break;
+
+        /* There are no receive interrupts in this minimal driver.  SysTick
+         * wakes us within 1 ms to service the UART, which is well inside the
+         * 9600-baud byte period and avoids polling for the full timeout. */
+        __asm__ volatile("wfi" ::: "memory");
     }
     return count;
 }
